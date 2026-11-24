@@ -1,0 +1,9 @@
+node_modules/
+dist/
+*.ehpk
+*.log
+__pycache__/
+.env
+app/bot/state.json
+templates/
+.DS_Store

@@ -1,0 +1,20 @@
+# Render Blueprint — Odds & Coins backend (free tier)
+# Usage: copy this file to the REPO ROOT as render.yaml, then in the Render
+# dashboard: New -> Blueprint -> connect the repo. OR create the service
+# manually from the dashboard (see DEPLOY.md) — same settings.
+services:
+  - type: web
+    name: odds-coins-server
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: npm start
+    # Render injects PORT automatically; the server reads process.env.PORT.
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Set COINGECKO_API_KEY in the Render dashboard (Environment tab) to
+      # your free CoinGecko Demo API key. Never commit the real key.
+      - key: COINGECKO_API_KEY
+        sync: false

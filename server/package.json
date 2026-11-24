@@ -1,0 +1,1 @@
+{"description":"Backend for Odds & Coins (Even Realities hackathon, Track 02) — CoinGecko prices + Polymarket odds.","engines":{"node":">=20"},"main":"server.js","name":"odds-coins-server","private":true,"scripts":{"start":"node server.js"},"type":"module","version":"0.1.0"}

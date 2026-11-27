@@ -8,19 +8,19 @@ live Polymarket Yes/No odds on the same 576×288 monochrome screen, so you can
 see in a second whether the crowd agrees with the price. 100% paper — no funds,
 no trades, no financial advice.
 
-## Screens (Day 2 + Day 3 — done)
+## Screens (Day 2 + Day 3 + Day 4 — done)
 
 1. **Ticker** — top 8 coins, price + 24h%. Tap cycles selection, scroll-down
    opens Detail, long-press opens Trade.
 2. **Detail** — selected coin: price + 24h% plus the best-matching Polymarket
-   market with Yes/No odds.
+   market with Yes/No odds. Long-press opens Digest.
 3. **Trade** — paper portfolio ($10,000 virtual, stored on-device). Tap buys
    $100 of the selected coin, scroll-down sells $100, long-press opens Alerts.
 4. **Alerts** — price alerts (Telegram delivery by the bot). Tap creates an
    "above +5%" alert, scroll-down a "below −5%" alert, long-press deletes
    the latest alert.
-
-Coming Thu 26 Nov (now Fri 27 Nov): Groq one-line digest + Digest screen.
+5. **Digest** — AI market digest (Groq, 10-min server cache). Tap or
+   scroll-down opens Trade, scroll-up or long-press back to Ticker.
 
 ## Architecture
 

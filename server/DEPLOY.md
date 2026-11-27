@@ -33,13 +33,16 @@ paste the CoinGecko key). Free tier, no payment method required.
 5. Click **Create Web Service** — the first deploy starts automatically.
 6. While it builds, open the **Environment** tab (left sidebar) and add:
    - Key: `COINGECKO_API_KEY`, Value: `<your free CoinGecko Demo key>`
+   - Key: `GROQ_API_KEY`, Value: `<your free Groq API key>` (Day 4 digest;
+     get one at https://console.groq.com/keys — free tier)
    - (Render sets `PORT` itself — do not set it.)
-   Click **Save Changes** — Render redeploys with the key.
+   Click **Save Changes** — Render redeploys with the keys.
 7. When the deploy shows **Live**, the URL is
    `https://odds-coins-server.onrender.com`. Verify in a browser or curl:
    - `https://odds-coins-server.onrender.com/health` → `{"ok":true}`
    - `https://odds-coins-server.onrender.com/api/prices` → 8 live coins
    - `https://odds-coins-server.onrender.com/api/markets` → 8 live markets
+   - `https://odds-coins-server.onrender.com/api/digest` → AI digest
 
 ## Option B — Blueprint (same result, via `render.yaml`)
 
@@ -47,8 +50,8 @@ paste the CoinGecko key). Free tier, no payment method required.
 2. In the Render dashboard: **New +** → **Blueprint** → connect the repo.
 3. Give the Blueprint a name, click **Apply**. Render creates the same
    free web service.
-4. Add `COINGECKO_API_KEY` in the service's **Environment** tab (step 6
-   above) and redeploy if needed.
+4. Add `COINGECKO_API_KEY` and `GROQ_API_KEY` in the service's
+   **Environment** tab (step 6 above) and redeploy if needed.
 
 ## After deploy — required app change
 
@@ -73,5 +76,5 @@ to whitelist: `odds-coins-server.onrender.com`.
   rule) or **Railway** (trial credit, card required) — both need more
   setup than Render. Stick with Render unless it fails.
 - The included `Dockerfile` (`node:24-alpine`, `CMD ["node", "server.js"]`)
-  works on any Docker host; it reads `PORT` and `COINGECKO_API_KEY` from
-  the environment.
+  works on any Docker host; it reads `PORT`, `COINGECKO_API_KEY` and
+  `GROQ_API_KEY` from the environment.

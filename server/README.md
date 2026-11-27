@@ -20,12 +20,28 @@ No build step, no dependencies. Node >= 20 required.
 | GET | `/health` | `{"ok":true}` |
 | GET | `/api/prices` | 8 coins: BTC, ETH, SOL, BNB, XRP, DOGE, ADA, TRX — `{id, symbol, name, price_usd, change_24h_pct}`. CoinGecko `/simple/price`, 60 s server cache. |
 | GET | `/api/markets` | Top 8 open Polymarket crypto markets — `{event_title, question, yes_pct, no_pct, volume, liquidity}`. Gamma `/events?tag_slug=crypto`, 120 s server cache. |
+| GET | `/api/digest` | AI market digest — `{digest, generatedAt, model}`. Groq `openai/gpt-oss-20b`, 10 min server cache. |
 | GET | `/api/alerts` | Stored price alerts — `{id, coin, direction, price, chatId, createdAt}`. Optional `?chatId=` filter. |
 | POST | `/api/alerts` | Create one alert — body `{coin, direction: "above"\|"below", price, chatId?}`. `chatId` defaults to the first chat registered with the Telegram bot. Returns 201 with the alert. |
 | DELETE | `/api/alerts/:id` | Delete one alert. Returns 200 with the deleted alert, 404 when unknown. |
 
 CORS: `Access-Control-Allow-Origin: *` on all responses (the Even Hub
 WebView fetch needs it). Preflight `OPTIONS` returns 204.
+
+## Digest (Day 4)
+
+`GET /api/digest` asks Groq (`openai/gpt-oss-20b` ONLY — `llama-3.1-8b-instant`
+is gone, 404) for a 2–3 sentence market digest from the live prices + top
+Polymarket market, cached 10 minutes. The prompt covers BTC/ETH only and
+asks for under 300 characters so it fits the 576×288 screen. Response:
+`{digest, generatedAt, model}`.
+
+**gpt-oss reasoning trap (verified live 27 Nov 2026):** the model spends its
+whole token budget on chain-of-thought reasoning unless `reasoning_effort`
+is `"low"` — without it the response is empty content with
+`finish_reason: "length"` (1022/1024 reasoning tokens at max_tokens 1024).
+With `"low"` it answers in ~94 tokens. Both the direct call and the
+`server/groq-digest.py` fallback pass `reasoning_effort: "low"`.
 
 ## Alerts (Day 3)
 
@@ -58,6 +74,17 @@ The key is **server-side only** and never shipped in the app/`.ehpk`.
   helper as a subprocess (last resort; the helper omits 24h change).
 
 Polymarket Gamma is public and needs no key.
+
+## Groq key — how it works
+
+Same pattern as CoinGecko: the key is **server-side only** and never shipped
+in the app/`.ehpk`. **Production (Render etc.):** set `GROQ_API_KEY` in the
+host dashboard. **Local dev:** the server fetches a dynamic-credential
+surrogate for `custom.groq` from the local authd Unix socket and sends it as
+the `Authorization: Bearer` header; the egress proxy resolves it. If the
+direct call fails, the server falls back to spawning
+`server/groq-digest.py` (same surrogate mechanism, prints
+`{"digest": "..."}`). The real key is never visible to this process.
 
 ## Polymarket notes (verified live 2026-11-24)
 

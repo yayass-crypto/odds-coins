@@ -8,6 +8,7 @@
 //   GET /api/alerts  -> list stored price alerts (optional ?chatId= filter)
 //   POST /api/alerts -> create one alert {coin, direction, price, chatId?}
 //   DELETE /api/alerts/:id -> delete one alert (also used by the bot after firing)
+//   GET /api/digest  -> short AI market digest (Groq openai/gpt-oss-20b, 10 min cache)
 //
 // CoinGecko auth (server-side only, never shipped to the app):
 //   1. COINGECKO_API_KEY env var if set (this is how Render/production runs).
@@ -36,6 +37,12 @@ const PORT = Number(process.env.PORT || 3001);
 const AUTHD_SOCK = process.env.JARVIS_AUTHD_SOCK || '/run/hatch/auth/authd.sock';
 const COINGECKO_HELPER =
   '/home/hatch/workspace/custom-connectors/custom.coingecko/bin/coingecko.py';
+const GROQ_HELPER =
+  '/home/hatch/workspace/hackathons-2026-11-20/even-realities/server/groq-digest.py';
+// NOTE: llama-3.1-8b-instant is GONE (404 since Nov 2026) — never use it.
+const GROQ_MODEL = 'openai/gpt-oss-20b';
+const DIGEST_TTL_MS = 600_000; // 10 minutes
+const GROQ_TIMEOUT_MS = 30_000;
 
 const COIN_IDS = [
   'bitcoin',
@@ -68,6 +75,7 @@ const UPSTREAM_TIMEOUT_MS = 15_000;
 const cache = {
   prices: { at: 0, data: null },
   markets: { at: 0, data: null },
+  digest: { at: 0, data: null },
 };
 
 function isFresh(entry, ttl) {
@@ -374,6 +382,118 @@ async function fetchMarketsLive() {
   }));
 }
 // ---------------------------------------------------------------------------
+// AI digest (Day 4): one short market summary from Groq, 10 min cache.
+// Model is openai/gpt-oss-20b ONLY — llama-3.1-8b-instant is gone (404).
+// Same credential pattern as CoinGecko: authd surrogate for custom.groq
+// (Bearer header; the egress proxy resolves it), browser User-Agent
+// (Groq sits behind Cloudflare), fallback to the groq.py helper.
+// ---------------------------------------------------------------------------
+const BROWSER_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36';
+
+async function groqDirect(prompt) {
+  // Production (Render): GROQ_API_KEY env var. Local dev: authd surrogate
+  // for custom.groq (never printed, never logged).
+  const apiKey = process.env.GROQ_API_KEY || (await fetchSurrogate('custom.groq'));
+  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${apiKey}`,
+      'User-Agent': BROWSER_UA,
+    },
+    body: JSON.stringify({
+      model: GROQ_MODEL,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: 512,
+      temperature: 0.7,
+      // gpt-oss-20b burns its whole token budget on chain-of-thought
+      // reasoning unless this is "low" — without it the model returns
+      // empty content with finish_reason "length" (verified 27 Nov 2026).
+      reasoning_effort: 'low',
+    }),
+    signal: AbortSignal.timeout(GROQ_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`Groq HTTP ${res.status}`);
+  const out = await res.json();
+  const text = out && out.choices && out.choices[0] && out.choices[0].message
+    ? String(out.choices[0].message.content || '').trim()
+    : '';
+  if (!text) throw new Error('Groq returned an empty completion');
+  return text;
+}
+
+function digestViaHelper(prompt) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('python3', [GROQ_HELPER, prompt], { timeout: 60000 });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => (out += d));
+    child.stderr.on('data', (d) => (err += d));
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`groq-digest.py exited ${code}: ${err.trim().slice(0, 200)}`));
+        return;
+      }
+      try {
+        const parsed = JSON.parse(out);
+        const text = parsed && typeof parsed.digest === 'string'
+          ? parsed.digest.trim()
+          : '';
+        if (!text) throw new Error('groq-digest.py returned an empty digest');
+        resolve(text);
+      } catch (e) {
+        reject(new Error(`groq-digest.py returned bad output: ${e.message}`));
+      }
+    });
+  });
+}
+
+function fmtDigestPrice(p) {
+  if (typeof p !== 'number' || !Number.isFinite(p)) return 'n/a';
+  if (p >= 1000) return '$' + Math.round(p).toLocaleString('en-US');
+  if (p >= 1) return '$' + p.toFixed(2);
+  return '$' + p.toFixed(4);
+}
+
+async function fetchDigestLive() {
+  const prices = isFresh(cache.prices, PRICES_TTL_MS)
+    ? cache.prices.data
+    : await fetchPricesLive();
+  const markets = isFresh(cache.markets, MARKETS_TTL_MS)
+    ? cache.markets.data
+    : await fetchMarketsLive();
+  const priceLines = (Array.isArray(prices) ? prices : [])
+    .slice(0, 3)
+    .map((c) => {
+      const chg = typeof c.change_24h_pct === 'number'
+        ? ` (${c.change_24h_pct >= 0 ? '+' : ''}${c.change_24h_pct.toFixed(1)}%)`
+        : '';
+      return `${c.symbol} ${fmtDigestPrice(c.price_usd)}${chg}`;
+    })
+    .join(', ');
+  const marketLines = (Array.isArray(markets) ? markets : [])
+    .slice(0, 1)
+    .map((m) => `'${m.question}' Yes ${m.yes_pct}%`)
+    .join('; ');
+  const prompt =
+    'Write a 2-3 sentence market digest in plain English for a smart-glasses ' +
+    'glance screen. Prices (24h change): ' + priceLines + '. ' +
+    'Top Polymarket crypto market: ' + marketLines + '. ' +
+    'Mention only BTC, ETH and that one Polymarket market. ' +
+    'No financial advice, no recommendations, just facts. ' +
+    'Keep it under 300 characters.';
+  let text;
+  try {
+    text = await groqDirect(prompt);
+  } catch (e) {
+    console.error('[digest] direct Groq call failed, trying helper:', e.message);
+    text = await digestViaHelper(prompt);
+  }
+  return { digest: text, generatedAt: new Date().toISOString(), model: GROQ_MODEL };
+}
+// ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
 function sendJson(res, status, payload) {
@@ -430,6 +550,10 @@ const server = http.createServer(async (req, res) => {
   }
   if (url.pathname === '/api/markets' && req.method === 'GET') {
     handleCached(req, res, cache.markets, MARKETS_TTL_MS, fetchMarketsLive, 'markets');
+    return;
+  }
+  if (url.pathname === '/api/digest' && req.method === 'GET') {
+    handleCached(req, res, cache.digest, DIGEST_TTL_MS, fetchDigestLive, 'digest');
     return;
   }
   if (url.pathname === '/api/alerts' && req.method === 'GET') {
@@ -499,6 +623,11 @@ server.listen(PORT, () => {
   console.log(
     `[odds-coins] CoinGecko key source: ${
       process.env.COINGECKO_API_KEY ? 'COINGECKO_API_KEY env var' : 'authd surrogate (custom.coingecko)'
+    }`,
+  );
+  console.log(
+    `[odds-coins] Groq key source: ${
+      process.env.GROQ_API_KEY ? 'GROQ_API_KEY env var' : 'authd surrogate (custom.groq)'
     }`,
   );
 });

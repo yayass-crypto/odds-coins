@@ -19,7 +19,7 @@ import {
 //     scroll up (ring)   -> back to Ticker
 //     tap (click)        -> show Detail for the next coin
 //     scroll down (ring) -> show Detail for the next coin
-//     long-press         -> open Trade for the selected coin
+//     long-press         -> open Digest
 //   Trade screen (paper portfolio, $10,000 virtual, $100/trade):
 //     tap (click)        -> BUY $100 of the selected coin
 //     scroll down (ring) -> SELL $100 of the selected coin
@@ -30,10 +30,14 @@ import {
 //     scroll down (ring) -> create alert: selected coin BELOW -5%
 //     scroll up (ring)   -> back to Ticker
 //     long-press         -> delete the most recent alert
+//   Digest screen (AI market summary, Groq, 10-min server cache):
+//     tap (click)        -> open Trade (retry the fetch when offline)
+//     scroll down (ring) -> open Trade
+//     scroll up (ring)   -> back to Ticker
+//     long-press         -> back to Ticker
 //   Any screen:
 //     double-tap         -> exit (system confirmation dialog, mode 1)
 //   Offline state: tap retries the fetch.
-//   (Day 4 adds the Digest screen; Detail long-press then opens Digest.)
 // ---------------------------------------------------------------------------
 // SDK rules honoured here:
 //   * waitForEvenAppBridge() before any SDK call.
@@ -66,7 +70,7 @@ interface Market {
   volume: number
 }
 
-type Screen = 'ticker' | 'detail' | 'trade' | 'alerts'
+type Screen = 'ticker' | 'detail' | 'trade' | 'alerts' | 'digest'
 
 interface Alert {
   id: string
@@ -99,6 +103,10 @@ let portfolio: Portfolio = { cash: START_CASH, holdings: {} }
 let alerts: Alert[] = []
 let tradeMsg = ''
 let alertMsg = ''
+// Day 4: AI market digest (Groq, 10-min server cache).
+let digestText = ''
+let digestLoading = false
+let digestError = false
 
 // --- formatting helpers ----------------------------------------------------
 function fmtPrice(p: number): string {
@@ -182,7 +190,7 @@ function detailContent(): string {
     lines.push(`Yes ${market.yes_pct}% / No ${market.no_pct}%`)
     lines.push(`Vol ${fmtVol(market.volume)}`)
   }
-  lines.push('Up: back - Tap: next - Hold: trade')
+  lines.push('Up: back - Tap: next - Hold: digest')
   return lines.join('\n')
 }
 
@@ -232,12 +240,27 @@ function alertsContent(): string {
   return lines.join('\n')
 }
 
+function digestContent(): string {
+  const lines = ['MARKET DIGEST']
+  if (digestLoading) {
+    lines.push('Loading digest...')
+  } else if (digestError || !digestText) {
+    lines.push('Digest offline')
+    lines.push('Tap: retry - Up: back')
+  } else {
+    lines.push(...wrap(digestText, 42).slice(0, 6))
+    lines.push('Tap: trade - Up: back')
+  }
+  return lines.join('\n')
+}
+
 function render(): void {
   let content: string
   if (screen === 'ticker') content = tickerContent()
   else if (screen === 'detail') content = detailContent()
   else if (screen === 'trade') content = tradeContent()
-  else content = alertsContent()
+  else if (screen === 'alerts') content = alertsContent()
+  else content = digestContent()
   bridge.textContainerUpgrade(
     new TextContainerUpgrade({
       containerID: 1,
@@ -406,6 +429,35 @@ async function deleteLatestAlert(): Promise<void> {
   render()
 }
 
+// --- AI digest (server-side Groq call, 10-min cache) ------------------------
+async function loadDigest(): Promise<void> {
+  digestLoading = true
+  digestError = false
+  render()
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/digest`)
+    if (!res.ok) throw new Error(`digest HTTP ${res.status}`)
+    const data = (await res.json()) as unknown
+    // Stale-cache responses arrive wrapped as {stale, data}; fresh ones bare.
+    const payload =
+      data && typeof data === 'object' && 'data' in data
+        ? (data as { data: unknown }).data
+        : data
+    const text =
+      payload && typeof payload === 'object' && 'digest' in payload
+        ? String((payload as { digest: unknown }).digest || '').trim()
+        : ''
+    if (!text) throw new Error('empty digest')
+    digestText = text
+    digestLoading = false
+  } catch (err) {
+    console.error('Odds & Coins: digest fetch failed:', err)
+    digestLoading = false
+    digestError = true
+  }
+  render()
+}
+
 // --- startup: exactly one container, created exactly once --------------------
 const mainText = new TextContainerProperty({
   xPosition: 0,
@@ -471,10 +523,14 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
     sysType === OsEventTypeList.LONG_PRESS_EVENT ||
     textType === OsEventTypeList.LONG_PRESS_EVENT
   ) {
-    if (screen === 'ticker' || screen === 'detail') {
+    if (screen === 'ticker') {
       screen = 'trade'
       tradeMsg = ''
       render()
+    } else if (screen === 'detail') {
+      screen = 'digest'
+      render()
+      void loadDigest()
     } else if (screen === 'trade') {
       screen = 'alerts'
       alertMsg = ''
@@ -482,6 +538,9 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
       void loadAlerts().then(render)
     } else if (screen === 'alerts') {
       void deleteLatestAlert()
+    } else if (screen === 'digest') {
+      screen = 'ticker'
+      render()
     }
     return
   }
@@ -512,12 +571,15 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
       sellSelected()
     } else if (screen === 'alerts') {
       void createAlert('below')
+    } else if (screen === 'digest') {
+      screen = 'trade'
+      render()
     }
     return
   }
 
   if (scroll === OsEventTypeList.SCROLL_TOP_EVENT) {
-    if (screen === 'detail' || screen === 'trade' || screen === 'alerts') {
+    if (screen === 'detail' || screen === 'trade' || screen === 'alerts' || screen === 'digest') {
       screen = 'ticker'
       render()
     } else {
@@ -542,6 +604,15 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
     }
     if (screen === 'alerts') {
       void createAlert('above')
+      return
+    }
+    if (screen === 'digest') {
+      if (digestError) {
+        void loadDigest() // offline: tap retries
+      } else {
+        screen = 'trade'
+        render()
+      }
       return
     }
     nextCoin()

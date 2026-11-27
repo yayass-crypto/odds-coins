@@ -20,9 +20,21 @@ No build step, no dependencies. Node >= 20 required.
 | GET | `/health` | `{"ok":true}` |
 | GET | `/api/prices` | 8 coins: BTC, ETH, SOL, BNB, XRP, DOGE, ADA, TRX — `{id, symbol, name, price_usd, change_24h_pct}`. CoinGecko `/simple/price`, 60 s server cache. |
 | GET | `/api/markets` | Top 8 open Polymarket crypto markets — `{event_title, question, yes_pct, no_pct, volume, liquidity}`. Gamma `/events?tag_slug=crypto`, 120 s server cache. |
+| GET | `/api/alerts` | Stored price alerts — `{id, coin, direction, price, chatId, createdAt}`. Optional `?chatId=` filter. |
+| POST | `/api/alerts` | Create one alert — body `{coin, direction: "above"\|"below", price, chatId?}`. `chatId` defaults to the first chat registered with the Telegram bot. Returns 201 with the alert. |
+| DELETE | `/api/alerts/:id` | Delete one alert. Returns 200 with the deleted alert, 404 when unknown. |
 
 CORS: `Access-Control-Allow-Origin: *` on all responses (the Even Hub
 WebView fetch needs it). Preflight `OPTIONS` returns 204.
+
+## Alerts (Day 3)
+
+Alerts are stored on disk in `server/alerts.json` (gitignored — never
+committed; it holds Telegram chat ids). The glasses app creates them from
+the Alerts screen; the Telegram bot polls `GET /api/alerts` about once a
+minute, sends a message to the alert's chat when the price crosses the
+target, then deletes the alert via `DELETE /api/alerts/:id`. The bot also
+answers `/alerts` in Telegram with the chat's current alerts.
 
 **Stale fallback:** if an upstream call fails, the endpoint returns the last
 cached payload as `{"stale":true,"data":[...]}` (HTTP 200). With no cache at

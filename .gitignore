@@ -5,5 +5,6 @@ dist/
 __pycache__/
 .env
 app/bot/state.json
+server/alerts.json
 templates/
 .DS_Store

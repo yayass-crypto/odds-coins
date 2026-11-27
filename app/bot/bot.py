@@ -14,7 +14,12 @@ Commands (Indonesian):
   /price <coin>   live price from CoinGecko, e.g. /price bitcoin
   /odds   top Polymarket crypto markets with Yes prices
   /ask <question>   short Groq answer about crypto/markets
+  /alerts list your stored price alerts (created in the glasses app)
   /ping   health check
+
+The long-polling loop also checks stored price alerts against live
+prices about once a minute (check_alerts) and sends a Telegram message
+to the alert's chat when one triggers, then deletes it via the backend.
 
 Usage:
   bot.py                 run the long-polling loop (foreground)
@@ -29,6 +34,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -37,6 +43,11 @@ TG = os.path.join(HOME, "workspace/custom-connectors/custom.telegram/bin/telegra
 CG = os.path.join(HOME, "workspace/custom-connectors/custom.coingecko/bin/coingecko.py")
 GQ = os.path.join(HOME, "workspace/custom-connectors/custom.groq/bin/groq.py")
 STATE_FILE = os.path.join(HERE, "state.json")
+
+# Local backend (alerts store + cached prices). Override with
+# ODDS_COINS_BACKEND when the backend runs elsewhere.
+BACKEND_URL = os.environ.get("ODDS_COINS_BACKEND", "http://localhost:3001")
+ALERT_CHECK_INTERVAL = 60  # seconds between alert poll cycles
 
 POLY_EVENTS = ("https://gamma-api.polymarket.com/events"
                "?tag_slug=crypto&order=startDate&ascending=false&limit=20")
@@ -59,6 +70,7 @@ WELCOME = (
     "/price <koin> - harga live, contoh: /price bitcoin\n"
     "/odds - odds Polymarket crypto teratas\n"
     "/ask <pertanyaan> - tanya soal crypto/pasar\n"
+    "/alerts - daftar alert harga kamu\n"
     "/ping - cek bot hidup\n"
     "/help - daftar perintah"
 )
@@ -68,9 +80,17 @@ HELP = (
     "/price <koin> - harga live dari CoinGecko\n"
     "/odds - odds Polymarket crypto teratas\n"
     "/ask <pertanyaan> - jawaban singkat soal crypto/pasar\n"
+    "/alerts - daftar alert harga kamu\n"
     "/ping - cek bot hidup\n"
     "/start - pesan sambutan"
 )
+
+# CoinGecko id -> symbol (for alert messages).
+ID_TO_SYMBOL = {
+    "bitcoin": "BTC", "ethereum": "ETH", "solana": "SOL",
+    "binancecoin": "BNB", "ripple": "XRP", "dogecoin": "DOGE",
+    "cardano": "ADA", "tron": "TRX",
+}
 
 
 def log(msg):
@@ -238,6 +258,28 @@ def handle_update(update, state, dry_run=False):
             reply = "Odds Polymarket lagi tidak bisa diambil. Coba lagi sebentar."
         else:
             reply = "Odds Polymarket crypto teratas (Ya):\n" + "\n".join(lines)
+    elif cmd == "/alerts":
+        try:
+            alerts = fetch_alerts(chat_id)
+        except Exception as exc:
+            log(f"alerts list error: {exc}")
+            alerts = None
+        if alerts is None:
+            reply = "Daftar alert lagi tidak bisa diambil. Coba lagi sebentar."
+        elif not alerts:
+            reply = ("Belum ada alert.\nBuat dari aplikasi Odds & Coins di "
+                     "kacamata (layar Alerts).")
+        else:
+            lines = []
+            for a in alerts:
+                sym = ID_TO_SYMBOL.get(a.get("coin"), (a.get("coin") or "?").upper())
+                word = "di atas" if a.get("direction") == "above" else "di bawah"
+                try:
+                    price_txt = f"${a.get('price'):,.0f}"
+                except (TypeError, ValueError):
+                    price_txt = str(a.get("price"))
+                lines.append(f"- {sym} {word} {price_txt}")
+            reply = "Alert kamu:\n" + "\n".join(lines)
     elif cmd == "/ask":
         if not arg:
             reply = "Pakai: /ask <pertanyaan>, contoh: /ask apa itu Polymarket?"
@@ -269,6 +311,89 @@ def send_alert_all(state, text):
         except Exception as exc:
             log(f"alert to {chat_id} failed: {exc}")
     return sent
+
+
+# --- backend alerts --------------------------------------------------------
+# The backend (server/server.js) stores alerts on disk. The bot polls them
+# about once a minute, sends a Telegram message when one triggers, then
+# deletes it. Backend calls bypass the proxy (localhost).
+
+def backend_get(path, timeout=10):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(BACKEND_URL + path)
+    req.add_header("User-Agent", UA)
+    with opener.open(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+
+def fetch_alerts(chat_id=None):
+    path = "/api/alerts"
+    if chat_id is not None:
+        path += "?chatId=" + urllib.parse.quote(str(chat_id))
+    out = backend_get(path)
+    return out if isinstance(out, list) else []
+
+
+def delete_alert(alert_id):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(
+        BACKEND_URL + "/api/alerts/" + urllib.parse.quote(str(alert_id)),
+        method="DELETE",
+    )
+    with opener.open(req, timeout=10) as resp:
+        return json.load(resp)
+
+
+def check_alerts(state):
+    """One alert poll cycle. Returns how many alerts fired."""
+    try:
+        alerts = fetch_alerts()
+    except Exception as exc:
+        log(f"alert check skipped (backend unreachable): {exc}")
+        return 0
+    if not alerts:
+        return 0
+    try:
+        prices = backend_get("/api/prices")
+    except Exception as exc:
+        log(f"alert check skipped (prices unreachable): {exc}")
+        return 0
+    if isinstance(prices, dict):
+        prices = prices.get("data") or []
+    by_id = {row.get("id"): row for row in prices if isinstance(row, dict)}
+    fired = 0
+    for alert in alerts:
+        row = by_id.get(alert.get("coin"))
+        if not row or not isinstance(row.get("price_usd"), (int, float)):
+            continue
+        price = row["price_usd"]
+        target = alert.get("price")
+        direction = alert.get("direction")
+        if not isinstance(target, (int, float)):
+            continue
+        hit = (direction == "above" and price >= target) or (
+            direction == "below" and price <= target
+        )
+        if not hit:
+            continue
+        sym = ID_TO_SYMBOL.get(alert.get("coin"), (alert.get("coin") or "?").upper())
+        word = "di atas" if direction == "above" else "di bawah"
+        text = (
+            f"Alert Odds & Coins: {sym} {word} ${target:,.0f} — "
+            f"harga sekarang ${price:,.2f}."
+        )
+        try:
+            send_message(alert["chatId"], text)
+        except Exception as exc:
+            log(f"alert {alert.get('id')} send failed: {exc}")
+            continue
+        try:
+            delete_alert(alert["id"])
+        except Exception as exc:
+            log(f"alert {alert.get('id')} delete failed: {exc}")
+        fired += 1
+        log(f"alert fired: {sym} {word} ${target:,.0f} (now ${price:,.2f})")
+    return fired
 
 
 # --- polling loop --------------------------------------------------------
@@ -313,6 +438,7 @@ def main(argv):
 
     log("Odds & Coins bot starting (long polling)")
     state = load_state()
+    last_alert_check = 0
     while True:
         try:
             n = poll_once(state)
@@ -321,6 +447,15 @@ def main(argv):
         except Exception as exc:
             log(f"poll error: {exc}")
             time.sleep(5)
+        # Price-alert poll (~once a minute, best effort, never blocks polling).
+        if time.time() - last_alert_check >= ALERT_CHECK_INTERVAL:
+            last_alert_check = time.time()
+            try:
+                fired = check_alerts(state)
+                if fired:
+                    log(f"alert check: {fired} fired")
+            except Exception as exc:
+                log(f"alert check error: {exc}")
 
 
 if __name__ == "__main__":

@@ -7,20 +7,33 @@ import {
 } from '@evenrealities/even_hub_sdk'
 
 // ---------------------------------------------------------------------------
-// Odds & Coins — Ticker + Detail screens (Track 02, com.yass.oddscoins)
+// Odds & Coins — Ticker + Detail + Trade + Alerts screens (Track 02)
 // ---------------------------------------------------------------------------
 // NAVIGATION SCHEME (single text container, 576x288, one thing per screen):
 //   Ticker screen:
 //     tap (click)        -> cycle selection to the next of the top 8 coins
 //     scroll down (ring) -> open Detail for the selected coin
 //     scroll up (ring)   -> cycle selection to the previous coin
+//     long-press         -> open Trade for the selected coin
 //   Detail screen:
 //     scroll up (ring)   -> back to Ticker
 //     tap (click)        -> show Detail for the next coin
 //     scroll down (ring) -> show Detail for the next coin
+//     long-press         -> open Trade for the selected coin
+//   Trade screen (paper portfolio, $10,000 virtual, $100/trade):
+//     tap (click)        -> BUY $100 of the selected coin
+//     scroll down (ring) -> SELL $100 of the selected coin
+//     scroll up (ring)   -> back to Ticker
+//     long-press         -> open Alerts
+//   Alerts screen (price alerts, delivered by the Telegram bot):
+//     tap (click)        -> create alert: selected coin ABOVE +5%
+//     scroll down (ring) -> create alert: selected coin BELOW -5%
+//     scroll up (ring)   -> back to Ticker
+//     long-press         -> delete the most recent alert
 //   Any screen:
 //     double-tap         -> exit (system confirmation dialog, mode 1)
 //   Offline state: tap retries the fetch.
+//   (Day 4 adds the Digest screen; Detail long-press then opens Digest.)
 // ---------------------------------------------------------------------------
 // SDK rules honoured here:
 //   * waitForEvenAppBridge() before any SDK call.
@@ -53,7 +66,25 @@ interface Market {
   volume: number
 }
 
-type Screen = 'ticker' | 'detail'
+type Screen = 'ticker' | 'detail' | 'trade' | 'alerts'
+
+interface Alert {
+  id: string
+  coin: string
+  direction: 'above' | 'below'
+  price: number
+  chatId: string
+  createdAt: string
+}
+
+interface Portfolio {
+  cash: number
+  holdings: Record<string, number>
+}
+
+const PORTFOLIO_KEY = 'oddscoins:portfolio:v1'
+const START_CASH = 10_000
+const TRADE_SIZE_USD = 100
 
 const bridge = await waitForEvenAppBridge()
 
@@ -64,6 +95,10 @@ let markets: Market[] = []
 let selected = 0
 let loading = true
 let loadError = false
+let portfolio: Portfolio = { cash: START_CASH, holdings: {} }
+let alerts: Alert[] = []
+let tradeMsg = ''
+let alertMsg = ''
 
 // --- formatting helpers ----------------------------------------------------
 function fmtPrice(p: number): string {
@@ -127,7 +162,7 @@ function tickerContent(): string {
     const mark = i === selected ? '> ' : '  '
     lines.push(`${mark}${c.symbol} ${fmtPrice(c.price_usd)} ${fmtPct(c.change_24h_pct)}`)
   }
-  lines.push('Tap: next - Down: detail')
+  lines.push('Tap: next - Down: detail - Hold: trade')
   return lines.join('\n')
 }
 
@@ -147,12 +182,62 @@ function detailContent(): string {
     lines.push(`Yes ${market.yes_pct}% / No ${market.no_pct}%`)
     lines.push(`Vol ${fmtVol(market.volume)}`)
   }
-  lines.push('Up: back - Tap: next coin')
+  lines.push('Up: back - Tap: next - Hold: trade')
+  return lines.join('\n')
+}
+
+function portfolioValue(): number {
+  let total = portfolio.cash
+  for (const [id, qty] of Object.entries(portfolio.holdings)) {
+    const c = coins.find((x) => x.id === id)
+    if (c) total += qty * c.price_usd
+  }
+  return total
+}
+
+function tradeContent(): string {
+  const coin = coins[selected]
+  if (!coin) return 'ODDS & COINS\n\nNo coin selected'
+  const held = portfolio.holdings[coin.id] ?? 0
+  const pnl = portfolioValue() - START_CASH
+  const lines = [
+    `TRADE - ${coin.symbol}  ${fmtPrice(coin.price_usd)}`,
+    `Cash $${Math.round(portfolio.cash).toLocaleString('en-US')}  P&L ${pnl >= 0 ? '+' : ''}$${Math.round(pnl).toLocaleString('en-US')}`,
+    `Hold ${held.toFixed(4)} ${coin.symbol} ($${Math.round(held * coin.price_usd).toLocaleString('en-US')})`,
+  ]
+  if (tradeMsg) lines.push(tradeMsg)
+  lines.push('Tap: buy $100 - Down: sell $100')
+  lines.push('Up: back - Hold: alerts')
+  return lines.join('\n')
+}
+
+function alertsContent(): string {
+  const coin = coins[selected]
+  if (!coin) return 'ODDS & COINS\n\nNo coin selected'
+  const lines = [`ALERTS - ${coin.symbol}  ${fmtPrice(coin.price_usd)}`]
+  const mine = alerts.filter((a) => a.coin === coin.id)
+  const others = alerts.length - mine.length
+  if (!mine.length) {
+    lines.push('No alerts for this coin yet')
+  } else {
+    for (const a of mine.slice(0, 4)) {
+      lines.push(`${a.direction === 'above' ? 'Above' : 'Below'} ${fmtPrice(a.price)}`)
+    }
+    if (mine.length > 4) lines.push(`... +${mine.length - 4} more for ${coin.symbol}`)
+  }
+  if (others > 0) lines.push(`+${others} alert(s) on other coins`)
+  if (alertMsg) lines.push(alertMsg)
+  lines.push('Tap: +above 5% - Down: +below 5%')
+  lines.push('Up: back - Hold: del latest')
   return lines.join('\n')
 }
 
 function render(): void {
-  const content = screen === 'ticker' ? tickerContent() : detailContent()
+  let content: string
+  if (screen === 'ticker') content = tickerContent()
+  else if (screen === 'detail') content = detailContent()
+  else if (screen === 'trade') content = tradeContent()
+  else content = alertsContent()
   bridge.textContainerUpgrade(
     new TextContainerUpgrade({
       containerID: 1,
@@ -187,6 +272,137 @@ async function loadData(): Promise<void> {
     loading = false
     loadError = true
   }
+  render()
+}
+
+// --- paper portfolio (local storage, $10,000 virtual) ----------------------
+async function loadPortfolio(): Promise<void> {
+  try {
+    const raw = await bridge.getLocalStorage(PORTFOLIO_KEY)
+    if (raw) {
+      const parsed = JSON.parse(raw) as Portfolio
+      if (
+        typeof parsed.cash === 'number' &&
+        parsed.holdings &&
+        typeof parsed.holdings === 'object'
+      ) {
+        portfolio = parsed
+      }
+    }
+  } catch {
+    portfolio = { cash: START_CASH, holdings: {} }
+  }
+}
+
+async function savePortfolio(): Promise<void> {
+  try {
+    const ok = await bridge.setLocalStorage(PORTFOLIO_KEY, JSON.stringify(portfolio))
+    if (!ok) {
+      // The simulator's storage backend can refuse the write (in-memory
+      // only); on real G2 hardware this persists. Log so it is visible.
+      console.error('Odds & Coins: setLocalStorage returned false for portfolio')
+    }
+  } catch (err) {
+    console.error('Odds & Coins: portfolio save failed:', err)
+  }
+}
+
+function buySelected(): void {
+  const coin = coins[selected]
+  if (!coin) return
+  if (portfolio.cash < TRADE_SIZE_USD) {
+    tradeMsg = 'Cash under $100 - cannot buy'
+    render()
+    return
+  }
+  const qty = TRADE_SIZE_USD / coin.price_usd
+  portfolio.cash -= TRADE_SIZE_USD
+  portfolio.holdings[coin.id] = (portfolio.holdings[coin.id] ?? 0) + qty
+  tradeMsg = `Bought ${qty.toFixed(4)} ${coin.symbol} for $100`
+  void savePortfolio()
+  render()
+}
+
+function sellSelected(): void {
+  const coin = coins[selected]
+  if (!coin) return
+  const held = portfolio.holdings[coin.id] ?? 0
+  if (held <= 0) {
+    tradeMsg = `No ${coin.symbol} held - nothing to sell`
+    render()
+    return
+  }
+  const qty = Math.min(held, TRADE_SIZE_USD / coin.price_usd)
+  const proceeds = qty * coin.price_usd
+  portfolio.cash += proceeds
+  const rest = held - qty
+  if (rest <= 1e-9) delete portfolio.holdings[coin.id]
+  else portfolio.holdings[coin.id] = rest
+  tradeMsg = `Sold ${qty.toFixed(4)} ${coin.symbol} for $${proceeds.toFixed(0)}`
+  void savePortfolio()
+  render()
+}
+
+// --- alerts (server-side store, delivered by the Telegram bot) --------------
+async function loadAlerts(): Promise<void> {
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/alerts`)
+    if (res.ok) {
+      const data = (await res.json()) as Alert[]
+      if (Array.isArray(data)) alerts = data
+    }
+  } catch {
+    // Offline: keep the last list (possibly empty) and carry on.
+  }
+}
+
+/** Round a trigger price to a tidy step so the alert reads well. */
+function alertPrice(raw: number, direction: 'above' | 'below'): number {
+  const step = raw >= 1000 ? 100 : raw >= 1 ? 0.1 : 0.001
+  return direction === 'above'
+    ? Math.ceil(raw / step) * step
+    : Math.floor(raw / step) * step
+}
+
+async function createAlert(direction: 'above' | 'below'): Promise<void> {
+  const coin = coins[selected]
+  if (!coin) return
+  const price = alertPrice(
+    coin.price_usd * (direction === 'above' ? 1.05 : 0.95),
+    direction,
+  )
+  try {
+    const res = await fetch(`${BACKEND_URL}/api/alerts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ coin: coin.id, direction, price }),
+    })
+    if (!res.ok) {
+      alertMsg = 'Could not create alert'
+    } else {
+      alertMsg = `Alert: ${coin.symbol} ${direction} ${fmtPrice(price)}`
+    }
+  } catch {
+    alertMsg = 'Alert offline - try again'
+  }
+  await loadAlerts()
+  render()
+}
+
+async function deleteLatestAlert(): Promise<void> {
+  if (!alerts.length) {
+    alertMsg = 'No alerts to delete'
+    render()
+    return
+  }
+  const last = alerts[alerts.length - 1]
+  try {
+    await fetch(`${BACKEND_URL}/api/alerts/${last.id}`, { method: 'DELETE' })
+    alertMsg = 'Latest alert deleted'
+  } catch {
+    alertMsg = 'Delete failed - offline?'
+  }
+  await loadAlerts()
   render()
 }
 
@@ -249,6 +465,33 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
     return
   }
 
+  // Long-press: menu navigation (and delete on the Alerts screen).
+  // The release event carries no action — ignore it.
+  if (
+    sysType === OsEventTypeList.LONG_PRESS_EVENT ||
+    textType === OsEventTypeList.LONG_PRESS_EVENT
+  ) {
+    if (screen === 'ticker' || screen === 'detail') {
+      screen = 'trade'
+      tradeMsg = ''
+      render()
+    } else if (screen === 'trade') {
+      screen = 'alerts'
+      alertMsg = ''
+      render()
+      void loadAlerts().then(render)
+    } else if (screen === 'alerts') {
+      void deleteLatestAlert()
+    }
+    return
+  }
+  if (
+    sysType === OsEventTypeList.LONG_PRESS_RELEASE_EVENT ||
+    textType === OsEventTypeList.LONG_PRESS_RELEASE_EVENT
+  ) {
+    return
+  }
+
   // Scrolls arrive via textEvent (ring swipe); also accept sysEvent.
   const scroll =
     textType === OsEventTypeList.SCROLL_TOP_EVENT ||
@@ -265,12 +508,16 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
       render()
     } else if (screen === 'detail') {
       nextCoin() // detail for the next coin
+    } else if (screen === 'trade') {
+      sellSelected()
+    } else if (screen === 'alerts') {
+      void createAlert('below')
     }
     return
   }
 
   if (scroll === OsEventTypeList.SCROLL_TOP_EVENT) {
-    if (screen === 'detail') {
+    if (screen === 'detail' || screen === 'trade' || screen === 'alerts') {
       screen = 'ticker'
       render()
     } else {
@@ -289,6 +536,14 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
       void loadData() // offline: tap retries
       return
     }
+    if (screen === 'trade') {
+      buySelected()
+      return
+    }
+    if (screen === 'alerts') {
+      void createAlert('above')
+      return
+    }
     nextCoin()
     return
   }
@@ -302,7 +557,8 @@ const unsubscribe = bridge.onEvenHubEvent((event) => {
 })
 
 // --- go ------------------------------------------------------------------------
-void loadData()
+// Load the paper portfolio first (local storage), then live prices/odds.
+void loadPortfolio().then(() => loadData())
 // Refresh prices/odds every 60 s while the app is open.
 setInterval(() => {
   void loadData()

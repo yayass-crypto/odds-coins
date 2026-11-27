@@ -5,6 +5,9 @@
 //   GET /health       -> {"ok":true}
 //   GET /api/prices  -> CoinGecko /simple/price (8 coins, 60 s cache)
 //   GET /api/markets -> Polymarket Gamma /events?tag_slug=crypto (open only, top 8 by volume, 120 s cache)
+//   GET /api/alerts  -> list stored price alerts (optional ?chatId= filter)
+//   POST /api/alerts -> create one alert {coin, direction, price, chatId?}
+//   DELETE /api/alerts/:id -> delete one alert (also used by the bot after firing)
 //
 // CoinGecko auth (server-side only, never shipped to the app):
 //   1. COINGECKO_API_KEY env var if set (this is how Render/production runs).
@@ -22,7 +25,12 @@
 
 import http from 'node:http';
 import net from 'node:net';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PORT = Number(process.env.PORT || 3001);
 const AUTHD_SOCK = process.env.JARVIS_AUTHD_SOCK || '/run/hatch/auth/authd.sock';
@@ -64,6 +72,66 @@ const cache = {
 
 function isFresh(entry, ttl) {
   return entry.data !== null && Date.now() - entry.at < ttl;
+}
+
+// ---------------------------------------------------------------------------
+// Alerts (Day 3): persisted to server/alerts.json — NOT in git (see
+// .gitignore). An alert is {id, coin, direction: 'above'|'below', price,
+// chatId, createdAt}. The glasses app never sends a chatId (no keyboard),
+// so POST defaults it to the first chat registered with the Telegram bot
+// (app/bot/state.json) — the user who pressed Start.
+// ---------------------------------------------------------------------------
+const ALERTS_FILE = path.join(__dirname, 'alerts.json');
+const BOT_STATE_FILE = path.join(__dirname, '..', 'app', 'bot', 'state.json');
+
+let alerts = [];
+try {
+  const parsed = JSON.parse(fs.readFileSync(ALERTS_FILE, 'utf8'));
+  if (Array.isArray(parsed)) alerts = parsed;
+} catch {
+  alerts = [];
+}
+
+function saveAlerts() {
+  const tmp = ALERTS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(alerts, null, 2));
+  fs.renameSync(tmp, ALERTS_FILE);
+}
+
+function defaultChatId() {
+  try {
+    const state = JSON.parse(fs.readFileSync(BOT_STATE_FILE, 'utf8'));
+    const chats = Object.keys(state.chats || {});
+    return chats.length ? chats[0] : null;
+  } catch {
+    return null;
+  }
+}
+
+// Accept a CoinGecko id or a symbol (case-insensitive); returns the id or null.
+function normalizeCoin(value) {
+  if (typeof value !== 'string') return null;
+  const v = value.trim().toLowerCase();
+  if (COIN_IDS.includes(v)) return v;
+  for (const id of COIN_IDS) {
+    if (COIN_META[id].symbol.toLowerCase() === v) return id;
+  }
+  return null;
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+      if (raw.length > 10_000) {
+        req.destroy();
+        reject(new Error('body too large'));
+      }
+    });
+    req.on('end', () => resolve(raw));
+    req.on('error', reject);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -313,7 +381,7 @@ function sendJson(res, status, payload) {
   res.writeHead(status, {
     'Content-Type': 'application/json',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Cache-Control': 'no-store',
     'Content-Length': Buffer.byteLength(body),
@@ -341,34 +409,89 @@ async function handleCached(req, res, entry, ttl, fetcher, label) {
   }
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, OPTIONS',
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
     });
     res.end();
     return;
   }
-  if (req.method !== 'GET') {
-    sendJson(res, 405, { error: 'method not allowed' });
-    return;
-  }
-  if (url.pathname === '/health') {
+  if (url.pathname === '/health' && req.method === 'GET') {
     sendJson(res, 200, { ok: true });
     return;
   }
-  if (url.pathname === '/api/prices') {
+  if (url.pathname === '/api/prices' && req.method === 'GET') {
     handleCached(req, res, cache.prices, PRICES_TTL_MS, fetchPricesLive, 'prices');
     return;
   }
-  if (url.pathname === '/api/markets') {
+  if (url.pathname === '/api/markets' && req.method === 'GET') {
     handleCached(req, res, cache.markets, MARKETS_TTL_MS, fetchMarketsLive, 'markets');
     return;
   }
-  sendJson(res, 404, { error: 'not found' });
+  if (url.pathname === '/api/alerts' && req.method === 'GET') {
+    const chatId = url.searchParams.get('chatId');
+    sendJson(res, 200, chatId ? alerts.filter((a) => a.chatId === chatId) : alerts);
+    return;
+  }
+  if (url.pathname === '/api/alerts' && req.method === 'POST') {
+    let body;
+    try {
+      body = JSON.parse(await readBody(req));
+    } catch {
+      sendJson(res, 400, { error: 'invalid JSON body' });
+      return;
+    }
+    const coinId = normalizeCoin(body && body.coin);
+    if (!coinId) {
+      sendJson(res, 400, { error: 'unknown coin' });
+      return;
+    }
+    if (body.direction !== 'above' && body.direction !== 'below') {
+      sendJson(res, 400, { error: "direction must be 'above' or 'below'" });
+      return;
+    }
+    const price = Number(body.price);
+    if (!Number.isFinite(price) || price <= 0) {
+      sendJson(res, 400, { error: 'price must be a positive number' });
+      return;
+    }
+    const chatId = body.chatId != null ? String(body.chatId) : defaultChatId();
+    if (!chatId) {
+      sendJson(res, 400, { error: 'no chat registered — start the Telegram bot first' });
+      return;
+    }
+    const alert = {
+      id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+      coin: coinId,
+      direction: body.direction,
+      price,
+      chatId,
+      createdAt: new Date().toISOString(),
+    };
+    alerts.push(alert);
+    saveAlerts();
+    sendJson(res, 201, alert);
+    return;
+  }
+  if (url.pathname.startsWith('/api/alerts/') && req.method === 'DELETE') {
+    const id = decodeURIComponent(url.pathname.slice('/api/alerts/'.length));
+    const idx = alerts.findIndex((a) => a.id === id);
+    if (idx === -1) {
+      sendJson(res, 404, { error: 'alert not found' });
+      return;
+    }
+    const [deleted] = alerts.splice(idx, 1);
+    saveAlerts();
+    sendJson(res, 200, { deleted });
+    return;
+  }
+  sendJson(res, req.method === 'GET' ? 404 : 405, {
+    error: req.method === 'GET' ? 'not found' : 'method not allowed',
+  });
 });
 
 server.listen(PORT, () => {

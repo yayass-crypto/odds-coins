@@ -13,7 +13,13 @@ menjawab harga/odds, dan mengirim alert ke chat yang sudah `/start`.
 | `/price <koin>` | Harga live dari CoinGecko (contoh: `/price bitcoin`, `/price eth`) |
 | `/odds` | 5 pasar crypto Polymarket teratas berdasarkan volume, harga Ya |
 | `/ask <pertanyaan>` | Jawaban singkat (Groq gpt-oss-20b, maks 3 kalimat, tanpa saran finansial) |
+| `/alerts` | Daftar alert harga kamu (dibuat dari layar Alerts di kacamata) |
 | `/ping` | Cek bot hidup |
+
+Selain menjawab perintah, bot mengecek alert tersimpan sekitar sekali
+seminit (`check_alerts` di `bot.py`): bandingkan harga live dari backend
+dengan tiap alert, kirim pesan Telegram ke chat alert saat target
+tersentuh, lalu hapus alert itu lewat `DELETE /api/alerts/:id`.
 
 ## Menjalankan
 
